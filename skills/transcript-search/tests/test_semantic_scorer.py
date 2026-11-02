@@ -59,7 +59,7 @@ class TestSemanticScorer(unittest.TestCase):
         self.assertIn("***SENSITIVE", masked)
 
         # 测试 AWS 与 DB URL 密码脱敏
-        db_text = "连接串 postgres://admin:TESTFAKEPASS@10.0.0.1:5432/mydb 正在连库，key=AKIAQTESTFAKEKEY0000"
+        db_text = "连接串 postgres://admin:TESTFAKEPASS@192.0.2.1:5432/mydb 正在连库，key=AKIAQTESTFAKEKEY0000"
         db_masked = mask_sensitive_info(db_text)
         self.assertNotIn("TESTFAKEPASS", db_masked)
         self.assertNotIn("AKIAQTESTFAKEKEY0000", db_masked)

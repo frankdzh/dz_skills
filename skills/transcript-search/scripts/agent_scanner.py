@@ -58,6 +58,20 @@ def clean_text_snippet(text: Any, max_len: int = 80) -> str:
         s = s[:max_len] + "..."
     return s
 
+_ENV_TEXT_PREFIXES = ("<environment_context>", "<system-reminder", "# AGENTS.md")
+_USER_QUERY_REGEX = re.compile(r"<user_query[^>]*>\s*(.*?)\s*</user_query>", re.DOTALL)
+
+def is_env_noise(text: str) -> bool:
+    """判断文本是否为环境上下文/系统提醒等非业务噪声"""
+    return text.startswith(_ENV_TEXT_PREFIXES)
+
+def extract_user_query(text: str) -> str:
+    """WorkBuddy 把真实用户需求嵌在 <system-reminder> 包装内，优先取出 <user_query> 正文"""
+    if not text:
+        return ""
+    m = _USER_QUERY_REGEX.search(str(text))
+    return m.group(1).strip() if m else ""
+
 def extract_deep_transcript_content(filepath: str) -> str:
     """流式提取 transcript.jsonl 中的工具调用命令与重要消息（自动忽略检索技能命令与看板输出）"""
     if not filepath or not os.path.exists(filepath):
@@ -102,17 +116,17 @@ def extract_deep_transcript_content(filepath: str) -> str:
                                     if "search_agent_logs.py" in cmd:
                                         continue
                                     extracted.append(f"执行工具 {p.get('name', '')}: {cmd}")
-                    # 3. OMP / Pi 格式 (type == 'message')
+                    # 3. OMP / Pi 格式 (type == 'message')；WorkBuddy 同构，role/content 在顶层
                     elif record.get("type") == "message":
-                        msg = record.get("message", {})
-                        role = msg.get("role", "")
-                        c = msg.get("content", "")
+                        msg = record.get("message", {}) if isinstance(record.get("message"), dict) else {}
+                        role = msg.get("role") or record.get("role", "")
+                        c = msg.get("content") or record.get("content", "")
                         if isinstance(c, list):
                             for p in c:
                                 if isinstance(p, dict):
-                                    if p.get("type") == "text":
+                                    if isinstance(p.get("text"), str):
                                         t_val = str(p.get("text", "")).strip()
-                                        if t_val and not t_val.startswith("<environment_context>") and not t_val.startswith("# AGENTS.md"):
+                                        if t_val and not is_env_noise(t_val):
                                             if not is_search_skill_invocation(t_val) and not is_search_dashboard_output(t_val):
                                                 extracted.append(f"{role}: {t_val[:200]}")
                                     elif p.get("type") == "toolCall":
@@ -120,14 +134,21 @@ def extract_deep_transcript_content(filepath: str) -> str:
                                         if "search_agent_logs.py" not in args_str:
                                             extracted.append(f"执行工具 {p.get('name', '')}: {args_str[:150]}")
                         elif isinstance(c, str) and c:
-                            if not c.startswith("<environment_context>") and not c.startswith("# AGENTS.md"):
+                            if not is_env_noise(c):
                                 if not is_search_skill_invocation(c) and not is_search_dashboard_output(c):
                                     extracted.append(f"{role}: {c[:200]}")
+                    # 3.5 WorkBuddy 工具调用格式 (type == 'function_call')
+                    elif record.get("type") == "function_call":
+                        name = record.get("name", "")
+                        args_val = record.get("arguments")
+                        args_str = args_val if isinstance(args_val, str) else json.dumps(args_val, ensure_ascii=False)
+                        if name and "search_agent_logs.py" not in args_str:
+                            extracted.append(f"执行工具 {name}: {args_str[:150]}")
                     # 4. 提取常规消息内容
                     c = record.get("content") or record.get("text") or ""
                     if isinstance(c, str) and c:
                         # 过滤冗长环境上下文与检索技能输出
-                        if not c.startswith("<environment_context>") and not c.startswith("# AGENTS.md"):
+                        if not is_env_noise(c):
                             if not is_search_skill_invocation(c) and not is_search_dashboard_output(c):
                                 if len(c) > 200:
                                     c = c[:200]
@@ -706,7 +727,136 @@ def scan_codex_sessions(target_ws: str, start_dt: datetime.datetime, end_dt: dat
     return results
 
 # ==============================================================================
-# 5. 全量扫描总分发入口
+# 6. WorkBuddy (国内版 ~/.workbuddy / 国际版 ~/.workbuddy-ai)
+# ==============================================================================
+WORKBUDDY_DIR_NAMES = (".workbuddy", ".workbuddy-ai")
+WORKBUDDY_SKIP_USER_PREFIXES = (
+    "<system-reminder",
+    "<command-name",
+    "<local-command",
+    "<teammate-message",
+    "<task-notification",
+    "<cb_summary",
+    "You are now in Agent mode",
+    "Please continue",
+)
+
+def scan_workbuddy_sessions_from_dir(
+    base_dir: str, target_workspace: str,
+    start_dt: datetime.datetime, end_dt: datetime.datetime,
+    deep_scan: bool = False
+) -> List[Dict[str, Any]]:
+    projects_dir = os.path.join(base_dir, "projects") if os.path.basename(base_dir) != "projects" else base_dir
+    if not os.path.isdir(projects_dir):
+        return []
+
+    start_ts = start_dt.timestamp()
+    end_ts = end_dt.timestamp()
+    results = []
+
+    for filepath in glob.glob(os.path.join(projects_dir, "*", "*.jsonl")):
+        try:
+            mtime = os.path.getmtime(filepath)
+            if mtime < start_ts or mtime > end_ts:
+                continue
+
+            session_id = Path(filepath).stem
+            actual_cwd, ai_title, first_user, last_user, last_assistant = "", "", "", "", ""
+            user_prompts_labeled = []
+            total_user_turns = 0
+            has_non_search_user_turn = False
+
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if not line.strip(): continue
+                    try:
+                        record = json.loads(line)
+                        t = record.get("type")
+                        if not actual_cwd and record.get("cwd"):
+                            actual_cwd = record.get("cwd")
+                        if t == "ai-title" and record.get("aiTitle"):
+                            ai_title = record.get("aiTitle")
+                        elif t == "message":
+                            c = record.get("content", "")
+                            if isinstance(c, list):
+                                c = "\n".join(
+                                    p.get("text", "") for p in c
+                                    if isinstance(p, dict) and isinstance(p.get("text"), str)
+                                )
+                            c = str(c).strip() if c else ""
+                            if not c:
+                                continue
+                            role = record.get("role", "")
+                            if role == "user":
+                                uq = extract_user_query(c)
+                                if uq:
+                                    c = uq
+                                elif c.startswith(WORKBUDDY_SKIP_USER_PREFIXES):
+                                    continue
+                                total_user_turns += 1
+                                if is_search_skill_invocation(c):
+                                    continue
+                                has_non_search_user_turn = True
+                                user_prompts_labeled.append(f"[第 {len(user_prompts_labeled)+1} 轮提问] {c}")
+                                if not first_user: first_user = c
+                                last_user = c
+                            elif role == "assistant":
+                                if c.startswith(WORKBUDDY_SKIP_USER_PREFIXES):
+                                    continue
+                                if not is_search_dashboard_output(c):
+                                    last_assistant = c
+                    except Exception:
+                        continue
+
+            if is_pure_search_session(
+                total_user_turns,
+                has_non_search_user_turn,
+                title=clean_text_snippet(ai_title or first_user, 32) if (ai_title or first_user) else "",
+                last_assistant=last_assistant
+            ):
+                continue
+
+            is_target = target_workspace and is_matching_workspace(target_workspace, actual_cwd)
+            mod_dt = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+            session_title = f"WorkBuddy 会话 ({session_id[:8]})"
+            if ai_title:
+                session_title = f"WorkBuddy: {ai_title}"
+            elif first_user:
+                session_title = f"WorkBuddy: {clean_text_snippet(first_user, 32)}"
+
+            all_user_text = "\n".join(user_prompts_labeled)
+            deep_content = f"{all_user_text}\n{extract_deep_transcript_content(filepath)}".strip() if deep_scan else all_user_text
+
+            results.append({
+                "agent": "workbuddy",
+                "session_id": session_id,
+                "resume_command": None,
+                "title": session_title,
+                "workspace": actual_cwd or "未知目录",
+                "last_modified": mod_dt,
+                "is_current_workspace": bool(is_target),
+                "transcript_path": filepath,
+                "last_user_turn": last_user,
+                "last_assistant_turn": last_assistant,
+                "deep_content": deep_content
+            })
+        except Exception:
+            continue
+    return results
+
+def scan_workbuddy_sessions(target_ws: str, start_dt: datetime.datetime, end_dt: datetime.datetime, deep_scan: bool = False):
+    """依次扫描国内版与国际版数据目录（二者目录结构一致，仅根目录不同）"""
+    home = os.path.expanduser("~")
+    results = []
+    for dirname in WORKBUDDY_DIR_NAMES:
+        base_dir = os.path.join(home, dirname)
+        if os.path.isdir(base_dir):
+            results.extend(scan_workbuddy_sessions_from_dir(base_dir, target_ws, start_dt, end_dt, deep_scan))
+    return results
+
+# ==============================================================================
+# 7. 全量扫描总分发入口
 # ==============================================================================
 def scan_all_agents(
     target_workspace: str,
@@ -725,6 +875,7 @@ def scan_all_agents(
         ("omp", scan_omp_sessions),
         ("pi", scan_pi_sessions),
         ("codex", scan_codex_sessions),
+        ("workbuddy", scan_workbuddy_sessions),
     ]
 
     for name, scanner_fn in scanners:

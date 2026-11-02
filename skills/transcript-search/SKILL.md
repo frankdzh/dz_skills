@@ -6,7 +6,7 @@ description: "Use when needing to fuzzy search or semantically retrieve coding a
 # 多智能体会话日志模糊与语义检索技能 (Transcript Search)
 
 ## 概述
-跨机器上全量编码智能体（Antigravity、OMP、Claude Code、Codex、Pi、Cursor 等 20+ 款）的异构日志存储，**在任意自定义时间范围内（今天、昨天、近N天、指定日期区间）执行高性能的模糊与语义检索**。
+跨机器上全量编码智能体（Antigravity、OMP、Claude Code、Codex、Pi、WorkBuddy 等 20+ 款）的异构日志存储，**在任意自定义时间范围内（今天、昨天、近N天、指定日期区间）执行高性能的模糊与语义检索**。
 
 基于**灵活时空过滤 + 内存 SQLite FTS5 倒排索引 + 纯本地轻量混合语义评分**，实现**零常驻守护进程（Zero-Daemon）、零外部向量 API 依赖（Zero-API）、秒级即用即走**。以项目为纲，分级输出 Markdown 原生嵌套缩进看板，高亮命中切片并提供原生恢复命令。
 
@@ -56,7 +56,7 @@ python3 <skill-dir>/scripts/search_agent_logs.py "<搜索词>" --compact
 - `--compact`：启用紧凑/Token 友好模式，单行输出极简概要与恢复命令。
 - `--deep`：开启底层消息流与工具调用深度穿透扫描。
 - `--project`：限定特定项目/工作区物理路径。
-- `--agent`：限定智能体名称（如 `antigravity`, `claude`, `codex`, `omp`, `pi` 等）。
+- `--agent`：限定智能体名称（如 `antigravity`, `claude`, `codex`, `omp`, `pi`, `workbuddy` 等；`workbuddy` 自动覆盖国内版 `~/.workbuddy` 与国际版 `~/.workbuddy-ai`）。
 - `--total-elapsed`：可选，外部透传的交互总时延（秒），用于准确呈现端到端全链路耗时。
 - `--json`：以 JSON 格式输出原始结构化数据。
 
