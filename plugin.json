@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dz",
+  "displayName": "DZ Skills",
+  "version": "1.0.0",
+  "description": "DZ Skills 聚合库：提供 LLM 端点真伪探测 (llm-authenticity-probe) 与跨智能体会话日志检索 (transcript-search)",
+  "author": {
+    "name": "frankdzh",
+    "email": "30405364+frankdzh@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/frankdzh/dz_skills",
+  "repository": "https://github.com/frankdzh/dz_skills",
+  "license": "MIT",
+  "keywords": [
+    "dz",
+    "skills",
+    "transcript-search",
+    "llm-authenticity-probe",
+    "agent-tools"
+  ]
+}

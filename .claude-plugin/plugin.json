@@ -1,0 +1,11 @@
+{
+  "name": "dz",
+  "version": "1.0.0",
+  "description": "DZ Skills 聚合库：提供 LLM 端点真伪探测 (llm-authenticity-probe) 与跨智能体会话日志检索 (transcript-search)",
+  "license": "MIT",
+  "author": {
+    "name": "frankdzh",
+    "email": "30405364+frankdzh@users.noreply.github.com"
+  },
+  "skills": "./skills"
+}
