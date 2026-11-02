@@ -126,13 +126,16 @@ python3 scripts/probe.py --current
 
 按环境自动选源：
 
-1. **omp**：读 `~/.omp/agent/agent.db` 的 `model_usage`，取 `last_used_at`
-   最新一行（omp 不把当前模型写进静态配置，这是唯一可靠来源），去掉首段
-   角色 provider 名后按模型名定位端点；
+1. **omp / WorkBuddy**：omp 读 `~/.omp/agent/agent.db` 的 `model_usage`，
+   WorkBuddy 国内版与国际版分别读 `~/.workbuddy/workbuddy.db` 和
+   `~/.workbuddy-ai/workbuddy.db` 的 `sessions`。两版取最近一条会话，
+   再与 omp 的 `last_used_at` 比较，选择较新的实际使用记录；
 2. **Claude Code**：读 `~/.claude/settings.json` 的 `model` 字段，
-   配合同文件 `env.ANTHROPIC_BASE_URL` 定位端点（该端点接受任意模型名）。
+   配合同文件 `env.ANTHROPIC_BASE_URL` 定位端点（该端点接受任意模型名）；
+3. **opencode**：读 `opencode.json` 的顶层 `model`；
+4. **Codex**：读 `config.toml` 的顶层 `model`。
 
-两源都没有时明确报「无法确定当前模型」，并提示改用 `--model`。当前模型非 Claude/GPT 系时明确报
+各来源都没有时明确报「无法确定当前模型」，并提示改用 `--model`。当前模型非 Claude/GPT 系时明确报
 「测不了」并 exit 2——这是本技能的既定边界，不是失败。
 
 **家族门禁**：只鉴定 Claude 系与 GPT 系模型。gemini/glm/deepseek 等其他
@@ -159,7 +162,7 @@ python3 scripts/probe.py --url http://127.0.0.1:9999 \
 ### 端点发现（多源）
 
 `--list-config` / `--menu` / `--scan-config` / `--from-config` 共用
-`discover_endpoints()`，自动扫描本机四类配置：
+`discover_endpoints()`，自动扫描本机六类配置：
 
 | 源 | 文件 | 协议来源 | 凭据来源 |
 |---|---|---|---|
@@ -167,6 +170,8 @@ python3 scripts/probe.py --url http://127.0.0.1:9999 \
 | omp | `~/.omp/agent/models.db` | 每模型 `api` 字段（最准） | `<PROVIDER>_API_KEY` 环境变量 |
 | claude | `~/.claude/settings.json` | 固定 anthropic | `env.ANTHROPIC_AUTH_TOKEN` |
 | codex | `~/.codex/config.toml` | 模型名家族 | `experimental_bearer_token` |
+| workbuddy | `~/.workbuddy/models.json` | URL 路径与 `useCustomProtocol` | `apiKey` |
+| workbuddy-ai | `~/.workbuddy-ai/models.json` | URL 路径与 `useCustomProtocol` | `apiKey` |
 
 规则：
 
@@ -177,6 +182,8 @@ python3 scripts/probe.py --url http://127.0.0.1:9999 \
 - `claude-code` 端点标 `any_model`：模型名由请求决定，任意 Claude 名可测
 - codex 的 `wire_api = "responses"` 是 Codex 专属协议，本工具**不可测**，
   列表标 `⚠ 不可测`，不参与 `--scan-config`
+- WorkBuddy 自定义模型默认走 OpenAI `chat/completions`；URL 含 `/messages`
+  时走 Anthropic 协议。`useCustomProtocol` 只跳过 URL 规范化。
 - 模型名前缀自动剥离（`zp/`、`u/`、`oc/`、`openrouter/anthropic/` 等路由前缀）
   后再判家族，避免中转站命名差异导致误判「测不了」
 
@@ -298,7 +305,8 @@ PROBE_TIMEOUT=60 python3 scripts/probe.py --pick 1
 ### 从 code agent 配置读取
 
 `--from-config` / `--list-config` / `--menu` / `--scan-config` 共用
-`discover_endpoints()`，扫描四类本机配置（opencode / omp / claude / codex），
+`discover_endpoints()`，扫描六类本机配置（opencode / omp / claude / codex /
+workbuddy / workbuddy-ai），
 详见上文「端点发现（多源）」。baseURL 按协议归一：anthropic 面补
 `/v1/messages`，openai 面补 `/v1/chat/completions`。
 

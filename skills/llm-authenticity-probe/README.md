@@ -27,7 +27,7 @@
 | 你说 | Agent 实际执行 | 行为 |
 |---|---|---|
 | 「测一下 claude-haiku-5-5」 | `--model claude-haiku-5-5` | 自动扫本机配置，找出所有同名端点并逐个探测 |
-| 「我现在的模型是真的吗」 | `--current` | 自动选源：omp 使用记录 或 Claude Code 的 `settings.model` |
+| 「我现在的模型是真的吗」 | `--current` | 自动选源：omp 与 WorkBuddy 最近使用记录，或 Claude Code、opencode、Codex 配置 |
 | 「测一下这个端点」+ URL/Key | `--url ... --model ...` | 手动指定单个端点 |
 | 「我机器上都有哪些模型」 | `--list-config` | 只读列出，不发请求 |
 | 「把这些端点都测一遍」 | `--menu` / `--scan-config` | 勾选或批量扫描 |
@@ -78,7 +78,7 @@ python3 scripts/probe.py
 
 ## 端点自动发现
 
-`--list-config` / `--menu` / `--model` 会扫描本机四类配置：
+`--list-config` / `--menu` / `--model` 会扫描本机六类配置：
 
 | 来源 | 文件 |
 |---|---|
@@ -86,6 +86,8 @@ python3 scripts/probe.py
 | omp | `~/.omp/agent/models.db` |
 | Claude Code | `~/.claude/settings.json` |
 | Codex | `~/.codex/config.toml` |
+| WorkBuddy 国内版 | `~/.workbuddy/models.json` |
+| WorkBuddy 国际版 | `~/.workbuddy-ai/models.json` |
 
 默认只列「有凭据 + 协议兼容」的端点，`--all` 查看全量。符号链接、环境变量名映射均有处理。
 

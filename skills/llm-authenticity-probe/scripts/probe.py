@@ -39,6 +39,8 @@ KNOWN_SSE_EVENTS = {
 
 PASS, FAIL, SKIP, INFO, BLOCKED = "✓", "✗", "–", "·", "⊘"
 DEFAULT_CONFIG = os.path.expanduser("~/.config/opencode/opencode.json")
+WORKBUDDY_EDITIONS = ((".workbuddy", "workbuddy"),
+                      (".workbuddy-ai", "workbuddy-ai"))
 
 # 单请求超时。指纹探针只需确认字段结构，不需要长推理，30s 足够；
 # 过长会让「端点无响应」表现为长时间假死。可用 PROBE_TIMEOUT 覆盖。
@@ -923,6 +925,20 @@ def load_endpoints(cfg_path):
 DEFAULT_HOME = os.path.expanduser("~")
 
 
+def _open_sqlite_ro(path):
+    """只读打开 SQLite；无 WAL 侧车文件时退回不可变快照模式。"""
+    for suffix in ("mode=ro", "mode=ro&immutable=1"):
+        con = None
+        try:
+            con = sqlite3.connect(f"file:{path}?{suffix}", uri=True)
+            con.execute("SELECT 1").fetchone()
+            return con
+        except sqlite3.Error:
+            if con is not None:
+                con.close()
+    return None
+
+
 def _norm_base(base):
     """baseURL 归一：去尾斜杠，保留路径形态（协议面在探测时分流）。"""
     return (base or "").rstrip("/")
@@ -1196,10 +1212,86 @@ def _src_codex(home):
     return out
 
 
+def _workbuddy_proto(url, model, custom):
+    """WorkBuddy 的 URL 路径优先；自定义协议仅取消 URL 规范化。"""
+    u = (url or "").lower()
+    if "/messages" in u:
+        return "anthropic"
+    if "chat/completions" in u:
+        return "openai"
+    if custom:
+        fam = _family_of(model)
+        if fam in ("anthropic", "openai"):
+            return fam
+    return "openai"
+
+
+def _src_workbuddy(home):
+    """WorkBuddy 国内版与国际版的 models.json 自定义模型。"""
+    out = []
+    for dirname, source in WORKBUDDY_EDITIONS:
+        path = os.path.join(home, dirname, "models.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        models = data.get("models") if isinstance(data, dict) else data
+        if not isinstance(models, list):
+            continue
+        for model in models:
+            if not isinstance(model, dict) or model.get("disabled"):
+                continue
+            model_id, url = model.get("id"), model.get("url")
+            if not model_id or not url:
+                continue
+            proto = _workbuddy_proto(url, model_id,
+                                     model.get("useCustomProtocol"))
+            out.append(_mk(source, model_id, url, proto=proto, source=source,
+                           api_key=model.get("apiKey", ""),
+                           note="models.json 自定义模型"))
+    return out
+
+
+def _workbuddy_selected_model(home=None):
+    """取两个 WorkBuddy 版本中最近会话的上游模型与时间（Unix 秒）。"""
+    home = home or DEFAULT_HOME
+    selected = None
+    for dirname, source in WORKBUDDY_EDITIONS:
+        path = os.path.join(home, dirname, "workbuddy.db")
+        if not os.path.isfile(path):
+            continue
+        con = _open_sqlite_ro(path)
+        if con is None:
+            continue
+        try:
+            row = con.execute(
+                "SELECT model, COALESCE(last_activity_at, updated_at) "
+                "FROM sessions WHERE deleted_at IS NULL "
+                "ORDER BY COALESCE(last_activity_at, updated_at) DESC "
+                "LIMIT 1").fetchone()
+        except sqlite3.Error:
+            continue
+        finally:
+            con.close()
+        if not row or not row[0] or row[1] is None:
+            continue
+        model = row[0]
+        if model.startswith("custom-local:"):
+            model = model[len("custom-local:"):]
+        updated = row[1] / 1000
+        if selected is None or updated > selected[2]:
+            selected = (model, source, updated)
+    return selected
+
+
 def discover_endpoints(home=None, config=None, include_other=False):
     """扫描本机全部 code agent 配置，归一成可探测 target 列表。
 
-    源：opencode.json / omp models.db / claude settings / codex config.toml。
+    源：opencode.json / omp models.db / claude settings / codex config.toml /
+    WorkBuddy models.json。
     默认只保留 Claude 系与 GPT 系（本工具的鉴定范围），按 (baseURL, model)
     去重，靠前来源优先（显式 --config 最高）。
     """
@@ -1213,6 +1305,7 @@ def discover_endpoints(home=None, config=None, include_other=False):
     sources.append(_src_omp(home))
     sources.append(_src_claude(home))
     sources.append(_src_codex(home))
+    sources.append(_src_workbuddy(home))
 
     seen = {}
     for group in sources:
@@ -1482,6 +1575,23 @@ def current_model_key(home=None):
     return row[0] if row else None
 
 
+def _omp_last_used(home):
+    """omp 最近实际使用时间（Unix 秒），用于跨来源比较。"""
+    db = os.path.join(home, ".omp", "agent", "agent.db")
+    if not os.path.isfile(db):
+        return 0
+    con = _open_sqlite_ro(db)
+    if con is None:
+        return 0
+    try:
+        row = con.execute("SELECT MAX(last_used_at) FROM model_usage").fetchone()
+        return (row[0] if row else 0) or 0
+    except sqlite3.Error:
+        return 0
+    finally:
+        con.close()
+
+
 def _claude_selected_model(home=None):
     """Claude Code 当前选中的模型：~/.claude/settings.json 的 `model` 字段。
 
@@ -1561,12 +1671,16 @@ def _codex_current_target(home=None):
 def current_model_info(home=None):
     """当前模型 → (模型名, 来源)；都没有则 (None, None)。
 
-    优先级：omp 的实际使用记录 > Claude Code > opencode > Codex。
-    omp 记录更可信（是「真的跑过」）；后三者都是配置里选中的值。
+    优先级：omp 与 WorkBuddy 中较新的实际使用记录 > Claude Code >
+    opencode > Codex。omp 与 WorkBuddy 是实际使用记录，其余是配置值。
     """
+    home = home or DEFAULT_HOME
     key = current_model_key(home)
-    if key:
+    workbuddy = _workbuddy_selected_model(home)
+    if key and (workbuddy is None or _omp_last_used(home) >= workbuddy[2]):
         return (key.split("/", 1)[1] if "/" in key else key), "omp"
+    if workbuddy:
+        return workbuddy[:2]
     for source, getter in (("claude", _claude_selected_model),
                            ("opencode", _opencode_selected_model),
                            ("codex", _codex_selected_model)):
@@ -1580,31 +1694,38 @@ def find_current_endpoint(home=None, config=None):
     """当前会话模型 → 可探测端点。找不到返回 None。
 
     omp：model_key 去掉首段（角色名）后按模型名匹配端点。
+    WorkBuddy：在当前版本的自定义模型中匹配上游模型名。
     Claude Code：settings 的 model 直接配到 settings 的 BASE_URL 端点上
     （该端点接受任意模型名，见 _src_claude 的 any_model）。
     """
-    key = current_model_key(home)
-    if key:
-        parts = key.split("/", 1)
-        upstream = parts[1] if len(parts) > 1 else parts[0]
-        for cand in (upstream, upstream.rsplit("/", 1)[-1]):
+    home = home or DEFAULT_HOME
+    model, source = current_model_info(home)
+    if not model:
+        return None
+    if source == "omp":
+        for cand in (model, model.rsplit("/", 1)[-1]):
             hits = find_model_endpoints(cand, home=home, config=config)
             usable = [t for t in hits if _testable(t) and _target_key(t)]
             if usable:
                 return usable[0]
         return None
 
-    model, source = current_model_info(home)
-    if not model:
-        return None
     if source == "claude":
         # Claude Code 的端点接受任意模型名，直接把 settings 的 model 装上去
-        for t in _src_claude(home or DEFAULT_HOME):
+        for t in _src_claude(home):
             if _target_key(t):
                 return dict(t, model=model)
         return None
     if source == "codex":
         return _codex_current_target(home)
+    if source in ("workbuddy", "workbuddy-ai"):
+        want = _norm_model(model).lower()
+        for t in _src_workbuddy(home):
+            if (t["source"] == source
+                    and _norm_model(t["model"]).lower() == want
+                    and _target_key(t)):
+                return t
+        return None
     # opencode：按「顶层 model」在已发现的端点里按名定位
     for cand in (model, model.split("/", 1)[-1]):
         hits = find_model_endpoints(cand, home=home, config=config)
@@ -1620,6 +1741,8 @@ def _cmd_current(a):
     if not model:
         print("✗ 无法确定当前模型：未找到以下任一来源——"
               "omp 使用记录（~/.omp/agent/agent.db）、"
+              "WorkBuddy（~/.workbuddy/workbuddy.db 或 "
+              "~/.workbuddy-ai/workbuddy.db 的 sessions）、"
               "Claude Code（~/.claude/settings.json 的 model）、"
               "opencode（opencode.json 的 model）、"
               "Codex（config.toml 的 model）。", file=sys.stderr)
@@ -1627,6 +1750,8 @@ def _cmd_current(a):
               file=sys.stderr)
         return 2
     label = {"omp": "最近使用", "claude": "Claude Code 配置",
+             "workbuddy": "WorkBuddy 最近使用",
+             "workbuddy-ai": "WorkBuddy AI 最近使用",
              "opencode": "opencode 配置", "codex": "Codex 配置"}.get(
                  source, source)
     print(f"当前模型（{label}）  {model}")
@@ -1697,7 +1822,8 @@ def _cmd_list(a):
     """
     all_ts = discover_endpoints(config=a.config)
     if not all_ts:
-        print("未发现可探测端点（已扫描 opencode / omp / claude / codex 配置）。")
+        print("未发现可探测端点（已扫描 opencode / omp / claude / codex / "
+              "workbuddy 配置）。")
         return 1
     ts = all_ts if getattr(a, "all", False) else [
         t for t in all_ts if _testable(t) and _target_key(t)]
@@ -2055,7 +2181,7 @@ def print_usage():
         ],
         more=[
             ("--model 模型名（不给 URL）", "自动在本机全部配置里找同名端点并逐个测"),
-            ("--current", "定位当前会话模型（omp 最近使用）并探测"),
+            ("--current", "定位当前会话模型（omp / WorkBuddy 最近使用）并探测"),
             ("--from-config 提供方 模型名", "精确指定某个 provider 的端点"),
             ("--list-config ｜ --menu ｜ --scan-config", "列出 ｜ 勾选 ｜ 批量扫描全部端点"),
             ("--key-env 变量名", "凭据在自定义环境变量时点名（值不进 argv）"),
@@ -2132,13 +2258,14 @@ def main():
                     help="从指定环境变量读凭据（如 OPENAI_API_KEY）；值不进 argv")
     ap.add_argument("--model", help="模型 ID（协议按模型名自动识别）")
     ap.add_argument("--from-config", nargs=2, metavar=("PROVIDER", "MODEL"),
-                    help="按 provider/model 从本机配置定位端点（opencode/omp/claude/codex）")
+                    help="按 provider/model 从本机配置定位端点"
+                         "（opencode/omp/claude/codex/workbuddy）")
     ap.add_argument("--config", default=DEFAULT_CONFIG,
                     help="额外扫描的 opencode 配置路径（默认已扫 ~/.config/opencode）")
     ap.add_argument("--list-config", action="store_true",
                     help="列出本机可探测端点（多源），不发请求")
     ap.add_argument("--current", action="store_true",
-                    help="定位当前会话模型（omp 最近使用）并探测其端点")
+                    help="定位当前会话模型（omp / WorkBuddy 最近使用）并探测其端点")
     ap.add_argument("--all", action="store_true",
                     help="显示全量候选（含无凭据/不可测）；作用于 "
                          "--list-config 与 --menu")
